@@ -1,0 +1,27 @@
+# Core
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+joblib>=1.3
+
+# Deep learning
+torch>=2.1
+psutil>=5.9
+
+# Optional export/quantization (guarded in code)
+onnx>=1.15
+onnxruntime>=1.18
+# onnxruntime-tools deprecated; quantization API moved into onnxruntime
+
+# Optional plotting
+matplotlib>=3.7
+seaborn>=0.12
+
+# Optional ensemble
+lightgbm>=4.0
+
+# Phase 3 / Runtime services
+paho-mqtt>=1.6
+jsonschema>=4.19
+pydantic>=2.6
+streamlit>=1.36

@@ -1,0 +1,79 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.env/
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Logs & coverage
+*.log
+*.csv
+*.jsonl
+coverage.xml
+.coverage*
+
+# Artifacts and large binaries
+artifacts_phase1/
+artifacts_phase2/
+artifacts_phase3/
+artifacts_phase4/
+*.onnx
+*.pth
+*.pkl
+*.npz
+
+# Datasets
+*.csv
+IDSAI.csv
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+.env/
+
+# VS Code
+.vscode/
+
+# Data & artifacts
+IDSAI.csv
+artifacts_phase1/
+artifacts_phase2/
+
+# Model and cache files
+*.pth
+*.onnx
+*.pkl
+*.npz
+*.joblib
+
+# Logs & images
+*.log
+*.png
+
+# OS files
+.DS_Store
+Thumbs.db

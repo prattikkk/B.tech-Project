@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/iot/ingress.schema.json",
+  "title": "IoT Ingress Payload",
+  "type": "object",
+  "properties": {
+    "topic": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "features": {
+      "type": "object",
+      "description": "Feature name to value map",
+      "additionalProperties": { "type": ["number", "string", "boolean", "null"] }
+    },
+    "label": { "type": ["string", "number", "null"] }
+  },
+  "required": ["features"],
+  "additionalProperties": true
+}

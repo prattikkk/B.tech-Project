@@ -1,0 +1,16 @@
+{
+  "onnx": { "static_feature_axis": false },
+  "pruning": {
+    "enabled": false,
+    "method": "unstructured_l1",
+    "target_sparsity": 0.3,
+    "schedule_steps": 2,
+    "recovery_epochs": 0,
+    "recovery_lr": 1e-4,
+    "layer_names": ["fc2"],
+    "max_val_auc_drop": 0.002,
+    "max_val_acc_drop": 0.002
+  },
+  "fp16": { "export_fp16_onnx": false },
+  "qat": { "enabled": false, "epochs": 3 }
+}

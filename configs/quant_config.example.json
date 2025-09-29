@@ -1,0 +1,5 @@
+{
+  "max_auc_drop": 0.01,
+  "max_acc_drop": 0.02,
+  "strategy_order": ["last_one", "last_two", "mlp_only", "all_linear"]
+}
