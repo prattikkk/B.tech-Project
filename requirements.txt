@@ -25,3 +25,10 @@ paho-mqtt>=1.6
 jsonschema>=4.19
 pydantic>=2.6
 streamlit>=1.36
+
+# Input validation
+voluptuous>=0.13
+
+# Ensemble ONNX conversion (optional)
+skl2onnx>=1.15
+onnxmltools>=1.11

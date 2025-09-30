@@ -1,0 +1,59 @@
+{
+  "test_status": "FATAL_ERROR",
+  "test_reason": "Model checksum mismatch",
+  "test_timestamp": "2025-09-29T18:10:23.855967+00:00",
+  "environment": {
+    "python_version": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+    "working_directory": "C:\\Users\\prati\\IOTProject",
+    "psutil_available": true
+  },
+  "debug_events": [
+    {
+      "timestamp": "2025-09-29T18:10:23.829409+00:00",
+      "event_type": "PREFLIGHT_START",
+      "memory_mb": {
+        "rss": 24.14,
+        "vms": 14.12
+      },
+      "cpu_percent": 0.0
+    },
+    {
+      "timestamp": "2025-09-29T18:10:23.830572+00:00",
+      "event_type": "CHECKSUM_VERIFICATION_START",
+      "file": "C:\\Users\\prati\\IOTProject\\artifacts_phase2\\model_hybrid.onnx",
+      "memory_mb": {
+        "rss": 24.14,
+        "vms": 14.12
+      },
+      "cpu_percent": 0.0
+    },
+    {
+      "timestamp": "2025-09-29T18:10:23.855967+00:00",
+      "event_type": "CHECKSUM_COMPARISON",
+      "expected": "0cd3c88859259c52...",
+      "actual": "63fa07861a2d710d...",
+      "match": false,
+      "memory_mb": {
+        "rss": 24.24,
+        "vms": 14.19
+      },
+      "cpu_percent": 0.0
+    },
+    {
+      "timestamp": "2025-09-29T18:10:23.855967+00:00",
+      "event_type": "FATAL_ERROR",
+      "reason": "Model checksum mismatch",
+      "expected_checksum": "0cd3c88859259c52cec7954d58ca83dd5ff19f0b82f0822eb59e1e201ffbada8",
+      "actual_checksum": "63fa07861a2d710d1c1b1680df0560a3b5dbe4103a16d399e6b45e70671e488a",
+      "file": "C:\\Users\\prati\\IOTProject\\artifacts_phase2\\model_hybrid.onnx",
+      "memory_mb": {
+        "rss": 24.24,
+        "vms": 14.19
+      },
+      "cpu_percent": 0.0
+    }
+  ],
+  "expected_checksum": "0cd3c88859259c52cec7954d58ca83dd5ff19f0b82f0822eb59e1e201ffbada8",
+  "actual_checksum": "63fa07861a2d710d1c1b1680df0560a3b5dbe4103a16d399e6b45e70671e488a",
+  "file": "C:\\Users\\prati\\IOTProject\\artifacts_phase2\\model_hybrid.onnx"
+}

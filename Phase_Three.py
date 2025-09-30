@@ -303,8 +303,13 @@ _metrics = {"messages_total": 0,
             "last_batch_size": 0,
             # Rolling sum for avg batch size (divide by inference_batches_total)
             "total_batch_items": 0,
-            # Latest observed queue fill ratio (0-1)
-            "queue_fill_ratio": 0.0,
+            # Latest observed queue fill ratios (0-1)
+            "mqtt_queue_fill_ratio": 0.0,
+            "proc_queue_fill_ratio": 0.0,
+            # Queue backpressure metrics
+            "queue_dropped_total": 0,
+            "queue_size_max_observed": 0,
+            "backpressure_events_total": 0,
             # Count of model switches (placeholder for future dual-slot logic)
             "model_switch_count": 0,
             # Processing lag seconds (avg of batch items now - enqueue ts)
@@ -348,6 +353,66 @@ _metrics.update({
             # Resource metrics
             "memory_rss_mb": 0.0,
             "cpu_percent": 0.0})
+
+# ---------------- Checksum verification (fail-fast) ----------------
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _expected_onnx_sha256() -> str | None:
+    """Return expected sha256 for ONNX model from metadata.json or artifact_manifest.json if available."""
+    try:
+        meta_path = PHASE2_DIR / "metadata.json"
+        if meta_path.exists():
+            with meta_path.open('r', encoding='utf-8') as f:
+                meta = json.load(f)
+            for k in ("model_onnx_sha256", "model_onx_sha256", "model_sha256"):
+                if isinstance(meta, dict) and meta.get(k):
+                    return str(meta[k])
+            am = meta.get("artifacts_manifest") or {}
+            # support both dict-of-dicts and simple mapping
+            ent = am.get("model_hybrid.onnx")
+            if isinstance(ent, dict) and ent.get("sha256"):
+                return str(ent["sha256"])
+            if isinstance(am, dict) and isinstance(ent, str):
+                return ent
+    except Exception as e:
+        logger.debug("metadata.json read failed: %s", e)
+    try:
+        man_path = PHASE2_DIR / "artifact_manifest.json"
+        if man_path.exists():
+            with man_path.open('r', encoding='utf-8') as f:
+                mp = json.load(f)
+            exp = mp.get("model_hybrid.onnx")
+            if isinstance(exp, str) and len(exp) >= 32:
+                return exp
+    except Exception as e:
+        logger.debug("artifact_manifest.json read failed: %s", e)
+    return None
+
+def _fail_if_model_checksum_mismatch(model_path: Path) -> None:
+    """Compare actual vs expected sha256; exit(2) on mismatch. If expected missing and REQUIRE_MODEL_CHECKSUM=1, exit."""
+    try:
+        expected = _expected_onnx_sha256()
+        if expected:
+            actual = _file_sha256(model_path)
+            if actual != expected:
+                msg = f"Model checksum mismatch expected={expected[:12]} actual={actual[:12]} file={model_path.name}"
+                logger.critical(msg)
+                sys.exit(2)
+        else:
+            if os.getenv("REQUIRE_MODEL_CHECKSUM", "0").lower() in ("1","true","yes"):
+                logger.critical("No expected model checksum found in metadata.json or artifact_manifest.json; refusing to start (REQUIRE_MODEL_CHECKSUM=1)")
+                sys.exit(2)
+            else:
+                logger.warning("No expected ONNX checksum found (metadata/artifact_manifest); proceeding without verification")
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.warning("Checksum verification encountered an error: %s", e)
 
 # Rolling windows for latency percentiles and detection rates
 _latencies_ms_window = deque(maxlen=int(os.getenv("PHASE3_LATENCY_WINDOW", "2000")))
@@ -399,7 +464,15 @@ try:
                     f"phase3_auth_failures_total {_metrics['auth_failures_total']}",
                     f"phase3_last_batch_size {_metrics['last_batch_size']}",
                     f"phase3_avg_batch_size {(_metrics['total_batch_items'] / max(1,_metrics['inference_batches_total'])) if _metrics['inference_batches_total'] else 0}",
-                    f"phase3_queue_fill_ratio {_metrics['queue_fill_ratio']}",
+                    f"phase3_mqtt_queue_fill_ratio {_metrics['mqtt_queue_fill_ratio']}",
+                    f"phase3_proc_queue_fill_ratio {_metrics['proc_queue_fill_ratio']}",
+                    f"phase3_mqtt_queue_size {mqtt_queue.qsize()}",
+                    f"phase3_proc_queue_size {proc_queue.qsize()}",
+                    # Queue backpressure metrics
+                    f"phase3_queue_dropped_total {_metrics.get('queue_dropped_total', 0)}",
+                    f"phase3_queue_size_max_observed {_metrics.get('queue_size_max_observed', 0)}",
+                    f"phase3_backpressure_events_total {_metrics.get('backpressure_events_total', 0)}",
+                    f"phase3_mqtt_queue_max {MQTT_QUEUE_MAX}",
                     f"phase3_model_switch_count {_metrics['model_switch_count']}",
                     f"phase3_last_batch_processing_lag_sec {_metrics['last_batch_processing_lag_sec']}",
                     f"phase3_active_threshold {float(ACTIVE_THRESHOLD)}",
@@ -1047,6 +1120,12 @@ def _log_onnx_guidance(reason: str):
 
 if ORT and ONNX_MODEL_PATH.exists():
     try:
+        _fail_if_model_checksum_mismatch(ONNX_MODEL_PATH)
+    except SystemExit:
+        raise
+    except Exception as _chk_err:
+        logger.warning("Checksum preflight issue: %s", _chk_err)
+    try:
         sess_options = ort.SessionOptions()
         sess = ort.InferenceSession(str(ONNX_MODEL_PATH), sess_options, providers=['CPUExecutionProvider'])
         onnx_sess = sess
@@ -1148,6 +1227,12 @@ MODEL_ARTIFACT_SHA256 = "unknown"
 try:
     _model_artifact_path = None
     if USE_ONNX and ONNX_MODEL_PATH.exists():
+        try:
+            _fail_if_model_checksum_mismatch(ONNX_MODEL_PATH)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
         _model_artifact_path = ONNX_MODEL_PATH
     elif FINAL_MODEL_PATH.exists():
         _model_artifact_path = FINAL_MODEL_PATH
@@ -1542,6 +1627,14 @@ total_msgs = 0
 labeled_msgs = 0
 correct_preds = 0
 metrics_lock = threading.Lock()
+
+# Bounded queues for async processing
+MQTT_QUEUE_MAX = int(os.getenv("MQTT_QUEUE_MAX", "1000"))
+WORKER_POOL_SIZE = max(1, int(os.getenv("WORKER_POOL_SIZE", str(max(1, os.cpu_count()//2)))))
+
+# Raw MQTT message queue (bounded to prevent memory pressure)
+mqtt_queue: "queue.Queue[mqtt.MQTTMessage]" = queue.Queue(maxsize=MQTT_QUEUE_MAX)
+# Processed items queue (existing)
 proc_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=PROC_QUEUE_MAX)
 # Monotonic correlation/message id generator
 _corr_counter = itertools.count(1)
@@ -1721,7 +1814,8 @@ def _process_batch(items: list):
             _metrics['total_batch_items'] += n
             _metrics['last_batch_processing_lag_sec'] = avg_lag
             try:
-                _metrics['queue_fill_ratio'] = proc_queue.qsize() / float(max(1, proc_queue.maxsize))
+                _metrics['mqtt_queue_fill_ratio'] = mqtt_queue.qsize() / float(max(1, mqtt_queue.maxsize))
+                _metrics['proc_queue_fill_ratio'] = proc_queue.qsize() / float(max(1, proc_queue.maxsize))
             except Exception:
                 pass
             _metrics['buffered_messages'] = _prediction_buffer.size()
@@ -1767,60 +1861,22 @@ def _process_batch(items: list):
         except Exception:
             pass
 
-def _process_worker():
-    batch = []
-    last = time.time()
+def _mqtt_message_worker():
+    """Worker thread that processes raw MQTT messages from mqtt_queue."""
     while not shutdown_event.is_set():
         try:
-            item = proc_queue.get(timeout=0.05)
-            batch.append(item)
-            # Trigger on size
-            if len(batch) >= max(1, int(MICRO_BATCH_SIZE)):
-                _process_batch(batch)
-                batch = []
-                last = time.time()
-        except queue.Empty:
-            pass
-        # Trigger on latency
-        if batch and ((time.time() - last) * 1000.0 >= float(MICRO_BATCH_LATENCY_MS)):
-            _process_batch(batch)
-            batch = []
-            last = time.time()
-    # Flush remaining
-    if batch:
-        _process_batch(batch)
-
-# ----------------- MQTT client & callbacks ----------------
-client = mqtt.Client(protocol=mqtt.MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-# Flow control: avoid unbounded memory usage under burst
-try:
-    client.max_inflight_messages_set(20)
-    client.max_queued_messages_set(1000)
-except Exception:
-    pass
-
-def on_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
-        logger.info("Connected to MQTT broker %s:%d", MQTT_BROKER, MQTT_PORT)
-        client.subscribe(MQTT_TOPIC)
-        logger.info("Subscribed to %s", MQTT_TOPIC)
-        # Security posture warning: in production (ENV=prod) enforce TLS guidance
-        try:
-            if os.getenv("ENV", "dev").lower() == "prod" and not MQTT_TLS:
-                logger.warning("SECURITY: Running in ENV=prod without MQTT_TLS enabled. Set MQTT_TLS=1 and provide certs (MQTT_TLS_CA/MQTT_TLS_CERT/MQTT_TLS_KEY) for encryption & auth.")
-        except Exception:
-            pass
-    else:
-        logger.error("MQTT connect failed rc=%s", rc)
-        # Track auth/authorization failures per MQTT v5 return codes (4=bad user/pass, 5=not authorized)
-        if rc in (4,5):
+            msg = mqtt_queue.get(timeout=0.1)
             try:
-                with _metrics_lock:
-                    _metrics['auth_failures_total'] += 1
-            except Exception:
-                pass
+                _process_mqtt_message(msg)
+            except Exception as e:
+                logger.exception("Failed processing MQTT message: %s", e)
+            finally:
+                mqtt_queue.task_done()
+        except queue.Empty:
+            continue
 
-def on_message(client, userdata, msg, properties=None):
+def _process_mqtt_message(msg):
+    """Process a single MQTT message (moved from on_message callback)."""
     try:
         # Topic allowlist enforcement
         if TOPIC_ALLOWLIST and msg.topic not in TOPIC_ALLOWLIST:
@@ -1878,7 +1934,91 @@ def on_message(client, userdata, msg, properties=None):
             except Exception:
                 pass
     except Exception:
-        logger.exception("Failed processing message")
+        logger.exception("Failed processing MQTT message")
+
+def _process_worker():
+    """Worker thread that processes preprocessed items from proc_queue."""
+    batch = []
+    last = time.time()
+    while not shutdown_event.is_set():
+        try:
+            item = proc_queue.get(timeout=0.05)
+            batch.append(item)
+            # Trigger on size
+            if len(batch) >= max(1, int(MICRO_BATCH_SIZE)):
+                _process_batch(batch)
+                batch = []
+                last = time.time()
+        except queue.Empty:
+            pass
+        # Trigger on latency
+        if batch and ((time.time() - last) * 1000.0 >= float(MICRO_BATCH_LATENCY_MS)):
+            _process_batch(batch)
+            batch = []
+            last = time.time()
+    # Flush remaining
+    if batch:
+        _process_batch(batch)
+
+# ----------------- MQTT client & callbacks ----------------
+client = mqtt.Client(protocol=mqtt.MQTTv5, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+# Flow control: avoid unbounded memory usage under burst
+try:
+    client.max_inflight_messages_set(20)
+    client.max_queued_messages_set(1000)
+except Exception:
+    pass
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        logger.info("Connected to MQTT broker %s:%d", MQTT_BROKER, MQTT_PORT)
+        client.subscribe(MQTT_TOPIC)
+        logger.info("Subscribed to %s", MQTT_TOPIC)
+        # Security posture warning: in production (ENV=prod) enforce TLS guidance
+        try:
+            if os.getenv("ENV", "dev").lower() == "prod" and not MQTT_TLS:
+                logger.warning("SECURITY: Running in ENV=prod without MQTT_TLS enabled. Set MQTT_TLS=1 and provide certs (MQTT_TLS_CA/MQTT_TLS_CERT/MQTT_TLS_KEY) for encryption & auth.")
+        except Exception:
+            pass
+    else:
+        logger.error("MQTT connect failed rc=%s", rc)
+        # Track auth/authorization failures per MQTT v5 return codes (4=bad user/pass, 5=not authorized)
+        if rc in (4,5):
+            try:
+                with _metrics_lock:
+                    _metrics['auth_failures_total'] += 1
+            except Exception:
+                pass
+
+def on_message(client, userdata, msg, properties=None):
+    """Lightweight MQTT callback - just enqueue raw messages for worker processing."""
+    # Update queue metrics
+    current_size = mqtt_queue.qsize()
+    with _metrics_lock:
+        _metrics['mqtt_queue_fill_ratio'] = current_size / float(max(1, mqtt_queue.maxsize))
+        _metrics['queue_size_max_observed'] = max(_metrics.get('queue_size_max_observed', 0), current_size)
+        
+        # Check for backpressure threshold (90% capacity)
+        if current_size >= (0.9 * mqtt_queue.maxsize):
+            _metrics['backpressure_events_total'] += 1
+            if _metrics['backpressure_events_total'] % 50 == 1:  # Log every 50th event
+                logger.warning("BACKPRESSURE: queue utilization high (%d/%d = %.1f%%)", 
+                             current_size, mqtt_queue.maxsize, 
+                             (current_size / mqtt_queue.maxsize) * 100)
+    
+    try:
+        mqtt_queue.put_nowait(msg)
+        with _metrics_lock:
+            _metrics['messages_total'] += 1
+    except queue.Full:
+        # Drop message if queue full to prevent backlog/memory pressure
+        with _metrics_lock:
+            _metrics['rejected_payloads_total'] += 1
+            _metrics['queue_dropped_total'] += 1
+            
+        if _metrics['queue_dropped_total'] % 100 == 1:  # Log every 100th drop
+            logger.warning("MQTT queue full -> dropped %d messages (latest topic=%s)", 
+                         _metrics['queue_dropped_total'], msg.topic)
 
 client.on_connect = on_connect
 client.on_message = on_message
@@ -2157,6 +2297,13 @@ def main():
         os.environ["NUMEXPR_NUM_THREADS"] = str(OMP_THREADS)
     except Exception:
         pass
+    # Start MQTT message worker pool
+    for i in range(WORKER_POOL_SIZE):
+        t = threading.Thread(target=_mqtt_message_worker, daemon=True, name=f"mqtt-worker-{i}")
+        t.start()
+        logger.info("Started MQTT message worker %d/%d", i+1, WORKER_POOL_SIZE)
+    
+    # Start other workers
     threading.Thread(target=_process_worker, daemon=True).start()
     threading.Thread(target=_buffer_retry_loop, daemon=True).start()
     threading.Thread(target=_model_watch_loop, daemon=True).start()

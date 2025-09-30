@@ -28,6 +28,7 @@ import argparse
 import logging
 import hashlib
 import signal
+import queue
 import http.server
 import socketserver
 import threading
@@ -71,8 +72,10 @@ except Exception:
 # Optional packages
 try:
     import psutil
+    PSUTIL_AVAILABLE = True
 except Exception:
     psutil = None
+    PSUTIL_AVAILABLE = False
 
 try:
     import paho.mqtt.client as mqtt
@@ -89,6 +92,15 @@ except Exception as _onnx_e:
     _onnx_import_error = _onnx_e
 _metrics_mod = None
 _phase_verify_or_exit = None
+
+# Optional schema validation
+try:
+    from voluptuous import Schema, Required, Coerce, ALLOW_EXTRA  # type: ignore
+except Exception:
+    Schema = None  # type: ignore
+    Required = None  # type: ignore
+    Coerce = None  # type: ignore
+    ALLOW_EXTRA = None  # type: ignore
 
 # ----------------------
 # Paths & defaults
@@ -928,6 +940,36 @@ class MQTTInference:
         self.enable_ensemble = bool(enable_ensemble)
         self._lgbm_model = None
         self.threshold_deep_only = None
+        # Ingress validation toggle (can be disabled for synthetic tests)
+        try:
+            self._validate_ingress = os.getenv('VALIDATE_INGRESS', '1').lower() in ('1','true','yes')
+        except Exception:
+            self._validate_ingress = True
+        # Payload schema (if voluptuous available)
+        try:
+            if Schema and Required and Coerce and ALLOW_EXTRA:
+                # Flexible schema: require timestamp (string or float) and features, allow additional fields
+                self._payload_schema = Schema({
+                    Required('timestamp'): str,  # Accept timestamp as string (ISO format)
+                    Required('features'): dict
+                }, extra=ALLOW_EXTRA)
+            else:
+                self._payload_schema = None
+        except Exception:
+            self._payload_schema = None
+        
+        # Bounded queues for async processing
+        self.mqtt_queue_max = int(os.getenv("MQTT_QUEUE_MAX", "1000"))
+        self.worker_pool_size = max(1, int(os.getenv("WORKER_POOL_SIZE", str(max(1, os.cpu_count()//2)))))
+        self.mqtt_queue = queue.Queue(maxsize=self.mqtt_queue_max)
+        self._shutdown_event = threading.Event()
+        
+        # Backpressure policy configuration
+        self._backpressure_policy = os.getenv("BACKPRESSURE_POLICY", "drop").lower()  # drop, block, notify
+        self._backpressure_threshold = float(os.getenv("BACKPRESSURE_THRESHOLD", "0.9"))  # trigger at 90% capacity
+        self._backpressure_topic = os.getenv("BACKPRESSURE_TOPIC", "iot/backpressure")
+        self._backpressure_last_notify = 0.0
+        self._backpressure_notify_interval = float(os.getenv("BACKPRESSURE_NOTIFY_INTERVAL", "5.0"))  # seconds
         # Unified presence threshold
         self._min_feature_presence = float(min_feature_presence) if min_feature_presence is not None else float(os.getenv("MIN_FEATURE_PRESENCE", "0.9"))
         # Alert rate limiting tokens
@@ -1022,6 +1064,54 @@ class MQTTInference:
                 self.is_onnx = False  # force PyTorch branch
             else:
                 try:
+                    # Fail-fast checksum verification for ONNX
+                    try:
+                        def _exp_checksum() -> str | None:
+                            # metadata.json preferred
+                            mp = os.path.join(PHASE2_DIR, 'metadata.json')
+                            try:
+                                if os.path.exists(mp):
+                                    with open(mp, 'r', encoding='utf-8') as f:
+                                        mj = json.load(f)
+                                    for k in ('model_onnx_sha256','model_onx_sha256','model_sha256'):
+                                        if isinstance(mj, dict) and mj.get(k):
+                                            return str(mj[k])
+                                    am = mj.get('artifacts_manifest') or {}
+                                    ent = am.get('model_hybrid.onnx')
+                                    if isinstance(ent, dict) and ent.get('sha256'):
+                                        return str(ent['sha256'])
+                                    if isinstance(ent, str):
+                                        return ent
+                            except Exception:
+                                pass
+                            # artifact_manifest.json fallback
+                            ap = os.path.join(PHASE2_DIR, 'artifact_manifest.json')
+                            try:
+                                if os.path.exists(ap):
+                                    with open(ap, 'r', encoding='utf-8') as f:
+                                        aj = json.load(f)
+                                    val = aj.get('model_hybrid.onnx')
+                                    if isinstance(val, str) and len(val) >= 32:
+                                        return val
+                            except Exception:
+                                pass
+                            return None
+                        exp = _exp_checksum()
+                        if exp:
+                            actual = self._file_sha256(model_path_str)
+                            if actual != exp:
+                                logger.critical("Model checksum mismatch expected=%s actual=%s", exp[:12], actual[:12])
+                                raise SystemExit(2)
+                        else:
+                            if os.getenv('REQUIRE_MODEL_CHECKSUM','0').lower() in ('1','true','yes'):
+                                logger.critical("No expected model checksum found; refusing to start (REQUIRE_MODEL_CHECKSUM=1)")
+                                raise SystemExit(2)
+                            else:
+                                logger.warning("No expected ONNX checksum found (metadata/artifact_manifest); proceeding")
+                    except SystemExit:
+                        raise
+                    except Exception as _chk_e:
+                        logger.warning("Checksum verification skipped due to error: %s", _chk_e)
                     self.ort_sess = ort.InferenceSession(model_path_str, providers=["CPUExecutionProvider"])
                     self.ort_input = self.ort_sess.get_inputs()[0].name
                     logger.info("Loaded ONNX model for inference (onnxruntime).")
@@ -1053,28 +1143,57 @@ class MQTTInference:
                 self.model = load_quantized_model(model_path, device=device)
                 logger.info("Loaded PyTorch model for inference on device=%s.", device)
 
-        # Attempt ensemble LightGBM load if enabled
+        # Attempt ensemble LightGBM load if enabled (with ONNX optimization)
         if self.enable_ensemble:
             try:
-                import joblib
-                # Search common candidate filenames
-                candidates = [
-                    os.path.join(PHASE2_DIR, 'lgbm_model.pkl'),
-                    os.path.join(PHASE2_DIR, 'lgbm_model.joblib'),
-                    os.path.join(PHASE2_DIR, 'lightgbm_model.pkl'),
-                ]
-                found = None
-                for c in candidates:
-                    if os.path.exists(c):
-                        found = c
-                        break
-                if found:
-                    self._lgbm_model = joblib.load(found)
-                    logger.info("Loaded LightGBM ensemble model: %s", found)
-                else:
-                    logger.warning("Ensemble enabled but no LightGBM model file found among %s", [os.path.basename(x) for x in candidates])
+                # Try lightweight ONNX ensemble loader first
+                try:
+                    from ensemble_onnx_service import create_ensemble_loader
+                    
+                    # Check for microservice configuration
+                    use_microservice = os.getenv('ENSEMBLE_MICROSERVICE', '0').lower() in ('1', 'true', 'yes')
+                    microservice_port = int(os.getenv('ENSEMBLE_MICROSERVICE_PORT', '8765'))
+                    prefer_onnx = os.getenv('ENSEMBLE_PREFER_ONNX', '1').lower() in ('1', 'true', 'yes')
+                    
+                    self._lgbm_model = create_ensemble_loader(
+                        PHASE2_DIR, 
+                        prefer_onnx=prefer_onnx,
+                        use_microservice=use_microservice,
+                        microservice_port=microservice_port
+                    )
+                    
+                    if self._lgbm_model is not None:
+                        memory_info = getattr(self._lgbm_model, 'get_memory_info', lambda: {})()
+                        logger.info("✅ Loaded ensemble with ONNX optimization: %s", memory_info)
+                    else:
+                        raise Exception("ONNX ensemble loader returned None")
+                        
+                except Exception as onnx_err:
+                    logger.warning("ONNX ensemble loading failed, falling back to traditional: %s", onnx_err)
+                    
+                    # Fallback to traditional joblib loading
+                    import joblib
+                    candidates = [
+                        os.path.join(PHASE2_DIR, 'lgbm_model.pkl'),
+                        os.path.join(PHASE2_DIR, 'lgbm_model.joblib'),
+                        os.path.join(PHASE2_DIR, 'lightgbm_model.pkl'),
+                    ]
+                    found = None
+                    for c in candidates:
+                        if os.path.exists(c):
+                            found = c
+                            break
+                    if found:
+                        self._lgbm_model = joblib.load(found)
+                        logger.info("Loaded traditional LightGBM ensemble model: %s", found)
+                    else:
+                        logger.warning("Ensemble enabled but no LightGBM model file found among %s", 
+                                     [os.path.basename(x) for x in candidates])
+                        self._lgbm_model = None
+                        
             except Exception as e:
                 logger.warning("Failed loading ensemble model: %s", e)
+                self._lgbm_model = None
         # Ensure active threshold attr present
         if not hasattr(self, 'active_threshold'):
             self.active_threshold = self.threshold
@@ -1132,7 +1251,16 @@ class MQTTInference:
         self._metrics_enabled = enable_metrics
         self._metrics_port = int(metrics_port)
         self._metrics_started = False
-        self._metrics = {"messages_total": 0, "last_inference_ms": 0.0, "malformed_total": 0, "feature_presence_ratio_sum": 0.0}
+        self._metrics = {
+            "messages_total": 0, 
+            "last_inference_ms": 0.0, 
+            "malformed_total": 0, 
+            "feature_presence_ratio_sum": 0.0,
+            "queue_dropped_total": 0,
+            "queue_size_current": 0,
+            "queue_size_max_observed": 0,
+            "backpressure_events_total": 0
+        }
         self._start_time_global = self._start_time
         self._inference_batches = 0
         # Logit gap statistics (for confidence distribution monitoring)
@@ -1171,6 +1299,28 @@ class MQTTInference:
         self._domain_detection_done = False
         self._domain_samples = []  # list of np.ndarray raw feature vectors BEFORE scaling
         self._domain_detection_N = 25
+        
+        # Memory monitoring setup
+        self._memory_monitor_enabled = PSUTIL_AVAILABLE and os.getenv('MEMORY_MONITOR_ENABLED', '1').lower() in ('1', 'true', 'yes')
+        self._memory_log_interval = float(os.getenv('MEMORY_LOG_INTERVAL', '30.0'))  # seconds
+        self._memory_monitor_thread = None
+        self._memory_monitor_stop = threading.Event()
+        self._memory_stats = {
+            'rss_mb_current': 0.0,
+            'rss_mb_peak': 0.0,
+            'vms_mb_current': 0.0,
+            'cpu_percent': 0.0,
+            'last_updated': 0.0
+        }
+        
+        if self._memory_monitor_enabled:
+            logger.info("Memory monitoring enabled (interval=%.1fs)", self._memory_log_interval)
+            self._start_memory_monitoring()
+        else:
+            if not PSUTIL_AVAILABLE:
+                logger.warning("Memory monitoring disabled: psutil not available")
+            else:
+                logger.info("Memory monitoring disabled by config")
         # Metrics server lazy start
         if self._metrics_enabled:
             self._start_metrics_server()
@@ -1229,6 +1379,89 @@ class MQTTInference:
             pass
         self._auto_calibrate_temperature = False
 
+    def _start_memory_monitoring(self):
+        """Start background memory monitoring thread."""
+        if not PSUTIL_AVAILABLE:
+            logger.warning("Cannot start memory monitoring: psutil not available")
+            return
+            
+        if self._memory_monitor_thread is not None:
+            return  # Already started
+            
+        def _memory_monitor_worker():
+            """Background worker that logs memory stats periodically."""
+            import psutil
+            process = psutil.Process()
+            
+            while not self._memory_monitor_stop.wait(self._memory_log_interval):
+                try:
+                    # Get current memory info
+                    memory_info = process.memory_info()
+                    rss_mb = memory_info.rss / (1024 * 1024)
+                    vms_mb = memory_info.vms / (1024 * 1024) 
+                    
+                    # CPU usage (over interval)
+                    cpu_percent = process.cpu_percent()
+                    
+                    # Update stats
+                    self._memory_stats.update({
+                        'rss_mb_current': rss_mb,
+                        'rss_mb_peak': max(self._memory_stats.get('rss_mb_peak', 0), rss_mb),
+                        'vms_mb_current': vms_mb,
+                        'cpu_percent': cpu_percent,
+                        'last_updated': time.time()
+                    })
+                    
+                    # Log memory stats
+                    logger.info("Memory: RSS=%.1fMB (peak=%.1fMB) VMS=%.1fMB CPU=%.1f%%", 
+                               rss_mb, self._memory_stats['rss_mb_peak'], vms_mb, cpu_percent)
+                    
+                    # Check for memory leak patterns (basic heuristic)
+                    if hasattr(self, '_memory_baseline'):
+                        growth_mb = rss_mb - self._memory_baseline
+                        if growth_mb > 100:  # 100MB growth threshold
+                            logger.warning("Memory growth detected: +%.1fMB from baseline", growth_mb)
+                    else:
+                        # Set baseline after first measurement
+                        self._memory_baseline = rss_mb
+                        
+                except Exception as e:
+                    logger.error("Memory monitoring error: %s", e)
+                    
+        self._memory_monitor_thread = threading.Thread(target=_memory_monitor_worker, daemon=True)
+        self._memory_monitor_thread.start()
+        logger.info("Memory monitoring thread started")
+
+    def _stop_memory_monitoring(self):
+        """Stop memory monitoring thread."""
+        if self._memory_monitor_thread is not None:
+            self._memory_monitor_stop.set()
+            self._memory_monitor_thread.join(timeout=2.0)
+            self._memory_monitor_thread = None
+            logger.info("Memory monitoring stopped")
+
+    def get_memory_stats(self):
+        """Get current memory statistics for health endpoint."""
+        if not PSUTIL_AVAILABLE:
+            return {"error": "psutil not available"}
+            
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            
+            return {
+                "rss_mb": memory_info.rss / (1024 * 1024),
+                "vms_mb": memory_info.vms / (1024 * 1024),
+                "cpu_percent": process.cpu_percent(),
+                "peak_rss_mb": self._memory_stats.get('rss_mb_peak', 0),
+                "baseline_rss_mb": getattr(self, '_memory_baseline', 0),
+                "monitoring_enabled": self._memory_monitor_enabled,
+                "last_updated": self._memory_stats.get('last_updated', 0)
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
     def _start_metrics_server(self):
         if self._metrics_started:
             return
@@ -1241,6 +1474,32 @@ class MQTTInference:
                     ready = (handler_self._inference_batches > 0) or (time.time()-handler_self._start_time_global > 5)
                     data = ("ready" if ready else "starting").encode(); code = 200 if ready else 503
                     self.send_response(code); self.send_header('Content-Type','text/plain'); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data); return
+                if self.path == '/health':
+                    try:
+                        import json
+                        memory_stats = handler_self.get_memory_stats()
+                        health_data = {
+                            "status": "healthy",
+                            "uptime_seconds": int(time.time() - handler_self._start_time_global),
+                            "inference_batches": handler_self._inference_batches,
+                            "memory": memory_stats,
+                            "timestamp": time.time()
+                        }
+                        data = json.dumps(health_data, indent=2).encode()
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Content-Length', str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
+                    except Exception as e:
+                        error_data = json.dumps({"status": "error", "message": str(e)}).encode()
+                        self.send_response(500)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Content-Length', str(len(error_data)))
+                        self.end_headers()
+                        self.wfile.write(error_data)
+                        return
                 if self.path != '/metrics':
                     self.send_response(404); self.end_headers(); return
                 m = handler_self._metrics
@@ -1253,7 +1512,31 @@ class MQTTInference:
                     f"phase4_feature_presence_ratio_avg { (m['feature_presence_ratio_sum']/m['messages_total']) if m['messages_total']>0 else 0.0}",
                     f"phase4_temperature_current {getattr(handler_self,'temperature',1.0)}",
                     f"phase4_mode_locked_noscale {1 if getattr(handler_self,'_locked_noscale', False) else 0}",
+                    # Queue and backpressure metrics
+                    f"phase4_queue_size_current {m.get('queue_size_current', 0)}",
+                    f"phase4_queue_size_max {handler_self.mqtt_queue_max}",
+                    f"phase4_queue_size_max_observed {m.get('queue_size_max_observed', 0)}",
+                    f"phase4_queue_utilization_ratio {(m.get('queue_size_current', 0) / handler_self.mqtt_queue_max) if handler_self.mqtt_queue_max > 0 else 0.0}",
+                    f"phase4_queue_dropped_total {m.get('queue_dropped_total', 0)}",
+                    f"phase4_backpressure_events_total {m.get('backpressure_events_total', 0)}",
+                    f"phase4_backpressure_threshold {handler_self._backpressure_threshold}",
                 ]
+                # Memory metrics
+                try:
+                    memory_stats = handler_self._memory_stats
+                    if memory_stats.get('last_updated', 0) > 0:
+                        lines.extend([
+                            f"phase4_memory_rss_mb {memory_stats.get('rss_mb_current', 0)}",
+                            f"phase4_memory_rss_peak_mb {memory_stats.get('rss_mb_peak', 0)}",
+                            f"phase4_memory_vms_mb {memory_stats.get('vms_mb_current', 0)}",
+                            f"phase4_cpu_percent {memory_stats.get('cpu_percent', 0)}",
+                            f"phase4_memory_monitoring_enabled {1 if handler_self._memory_monitor_enabled else 0}",
+                        ])
+                        if hasattr(handler_self, '_memory_baseline'):
+                            growth = memory_stats.get('rss_mb_current', 0) - handler_self._memory_baseline
+                            lines.append(f"phase4_memory_growth_mb {growth}")
+                except Exception:
+                    pass
                 # Latency percentiles
                 try:
                     if handler_self._latencies_ms:
@@ -1378,9 +1661,20 @@ class MQTTInference:
     def _graceful_exit(self, *args):
         try:
             logger.info("Phase 4 shutting down...")
+            # Stop memory monitoring
+            try:
+                self._stop_memory_monitoring()
+            except Exception:
+                pass
+            # Stop MQTT client
             try:
                 self.client.loop_stop()
                 self.client.disconnect()
+            except Exception:
+                pass
+            # Signal shutdown to worker threads
+            try:
+                self._shutdown_event.set()
             except Exception:
                 pass
         finally:
@@ -1677,9 +1971,157 @@ class MQTTInference:
         else:
             logger.error("MQTT connection failed with rc=%s", rc)
 
+    def _queue_monitor(self):
+        """Monitor queue size and update metrics periodically."""
+        while not self._shutdown_event.is_set():
+            try:
+                current_size = self.mqtt_queue.qsize()
+                self._metrics['queue_size_current'] = current_size
+                self._metrics['queue_size_max_observed'] = max(self._metrics['queue_size_max_observed'], current_size)
+                
+                # Check for sustained high utilization
+                utilization = current_size / self.mqtt_queue_max if self.mqtt_queue_max > 0 else 0.0
+                if utilization >= 0.95:  # Warn at 95% sustained utilization
+                    logger.warning("Queue utilization critically high: %d/%d (%.1f%%)", 
+                                 current_size, self.mqtt_queue_max, utilization * 100)
+                
+                time.sleep(1.0)  # Monitor every second
+            except Exception as e:
+                logger.debug("Queue monitor error: %s", e)
+                time.sleep(5.0)  # Back off on errors
+
+    def _mqtt_message_worker(self):
+        """Worker thread that processes raw MQTT messages from mqtt_queue."""
+        while not self._shutdown_event.is_set():
+            try:
+                msg = self.mqtt_queue.get(timeout=0.1)
+                try:
+                    self._process_mqtt_message(msg)
+                except Exception as e:
+                    logger.exception("Failed processing MQTT message: %s", e)
+                finally:
+                    self.mqtt_queue.task_done()
+            except queue.Empty:
+                continue
+
+    def _handle_backpressure(self, utilization, topic):
+        """Handle backpressure events based on configured policy."""
+        now = time.time()
+        
+        # Rate-limit backpressure notifications
+        if now - self._backpressure_last_notify < self._backpressure_notify_interval:
+            return
+            
+        self._backpressure_last_notify = now
+        
+        if self._backpressure_policy == "notify":
+            # Publish backpressure notification to MQTT
+            try:
+                backpressure_msg = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "service": "phase4",
+                    "queue_utilization": utilization,
+                    "queue_size": self.mqtt_queue.qsize(),
+                    "queue_max": self.mqtt_queue_max,
+                    "dropped_total": self._metrics['queue_dropped_total'],
+                    "source_topic": topic,
+                    "action": "backpressure_alert"
+                }
+                self.client.publish(self._backpressure_topic, json.dumps(backpressure_msg))
+                logger.warning("BACKPRESSURE alert published: utilization=%.2f%% queue=%d/%d dropped=%d", 
+                             utilization * 100, self.mqtt_queue.qsize(), self.mqtt_queue_max, 
+                             self._metrics['queue_dropped_total'])
+            except Exception as e:
+                logger.error("Failed to publish backpressure notification: %s", e)
+        else:
+            # Just log the backpressure event
+            logger.warning("BACKPRESSURE detected: utilization=%.2f%% queue=%d/%d policy=%s", 
+                         utilization * 100, self.mqtt_queue.qsize(), self.mqtt_queue_max, 
+                         self._backpressure_policy)
+
     def _on_message(self, client, userdata, msg):
+        """Lightweight MQTT callback - just enqueue raw messages for worker processing."""
+        # Early payload validation to prevent malformed data poisoning the queue
+        if self._validate_ingress:
+            try:
+                # Fast JSON decode with small safety limit
+                # paho already gives bytes; decode using utf-8 errors=ignore
+                raw = msg.payload.decode('utf-8', errors='ignore') if isinstance(msg.payload, (bytes, bytearray)) else str(msg.payload)
+                payload = json.loads(raw)
+                if self._payload_schema is not None:
+                    # Validate schema using voluptuous
+                    self._payload_schema(payload)
+                else:
+                    # Manual minimal validation fallback
+                    if not isinstance(payload, dict):
+                        raise ValueError('payload not a dict')
+                    if 'features' not in payload or not isinstance(payload['features'], dict):
+                        raise ValueError('missing or invalid features')
+                    # timestamp optional but if present should be valid (string or float)
+                    if 'timestamp' in payload:
+                        ts = payload['timestamp']
+                        if not isinstance(ts, (str, int, float)):
+                            raise ValueError('timestamp must be string or numeric')
+                # Attach pre-parsed payload to message to avoid re-parsing in worker
+                try:
+                    setattr(msg, '_validated_payload', payload)
+                except Exception:
+                    pass
+            except Exception as e:
+                # Count and log invalid payloads, do not enqueue
+                try:
+                    self._metrics['malformed_total'] += 1
+                except Exception:
+                    pass
+                # Log compact message with topic and size
+                try:
+                    sz = len(msg.payload) if hasattr(msg, 'payload') else 0
+                except Exception:
+                    sz = 0
+                logger.warning("Invalid MQTT payload (topic=%s size=%s): %s", getattr(msg, 'topic', '?'), sz, e)
+                return
+        # Update current queue size metric
+        current_size = self.mqtt_queue.qsize()
+        self._metrics['queue_size_current'] = current_size
+        self._metrics['queue_size_max_observed'] = max(self._metrics['queue_size_max_observed'], current_size)
+        
+        # Check if we're approaching backpressure threshold
+        utilization = current_size / self.mqtt_queue_max if self.mqtt_queue_max > 0 else 0.0
+        if utilization >= self._backpressure_threshold:
+            self._metrics['backpressure_events_total'] += 1
+            self._handle_backpressure(utilization, msg.topic)
+        
         try:
-            payload = json.loads(msg.payload.decode())
+            if self._backpressure_policy == "block":
+                # Blocking policy - may cause MQTT client issues if overused
+                try:
+                    self.mqtt_queue.put(msg, timeout=0.1)  # Short timeout to prevent hanging
+                except queue.Full:
+                    self._metrics['queue_dropped_total'] += 1
+                    logger.warning("Phase4 MQTT queue full (blocking policy timeout) -> dropping message (topic=%s)", msg.topic)
+            else:
+                # Default: non-blocking put (drop if full)
+                self.mqtt_queue.put_nowait(msg)
+        except queue.Full:
+            # Queue is full - drop message and increment counter
+            self._metrics['queue_dropped_total'] += 1
+            if self._metrics['queue_dropped_total'] % 100 == 1:  # Log every 100th drop to avoid spam
+                logger.warning("Phase4 MQTT queue full -> dropped %d messages (latest topic=%s policy=%s)", 
+                             self._metrics['queue_dropped_total'], msg.topic, self._backpressure_policy)
+
+    def _process_mqtt_message(self, msg):
+        """Process a single MQTT message (moved from original _on_message callback)."""
+        try:
+            # Reuse pre-validated payload if provided by _on_message
+            payload = getattr(msg, '_validated_payload', None)
+            if payload is None:
+                try:
+                    payload = json.loads(msg.payload.decode())
+                except Exception as e:
+                    self._metrics['malformed_total'] += 1
+                    if self.total % 50 == 0:
+                        logger.warning("Malformed JSON payload: %s", e)
+                    return
             # ---------------- Input Validation (Priority1) ----------------
             features_container = payload.get('features') if isinstance(payload, dict) else None
             candidate = features_container if isinstance(features_container, dict) else payload
@@ -1728,7 +2170,18 @@ class MQTTInference:
                 # Optional ensemble blend
                 if self.enable_ensemble and self._lgbm_model is not None:
                     try:
-                        lgbm_prob = float(self._lgbm_model.predict_proba(x_np)[0,1])
+                        # Handle both new ONNX loader and traditional model interfaces
+                        if hasattr(self._lgbm_model, 'predict_proba'):
+                            # Traditional sklearn-like interface or fallback model
+                            lgbm_probs = self._lgbm_model.predict_proba(x_np)
+                            if lgbm_probs.ndim == 2:
+                                lgbm_prob = float(lgbm_probs[0, 1])
+                            else:
+                                lgbm_prob = float(lgbm_probs[0])
+                        else:
+                            # New ONNX ensemble loader interface
+                            lgbm_probs = self._lgbm_model.predict_proba(x_np)
+                            lgbm_prob = float(lgbm_probs[0])
                         prob_attack = 0.5 * prob_attack + 0.5 * lgbm_prob
                     except Exception:
                         pass
@@ -1743,7 +2196,18 @@ class MQTTInference:
                     prob_attack = float(probs[1])
                     if self.enable_ensemble and self._lgbm_model is not None:
                         try:
-                            lgbm_prob = float(self._lgbm_model.predict_proba(x_np)[0,1])
+                            # Handle both new ONNX loader and traditional model interfaces
+                            if hasattr(self._lgbm_model, 'predict_proba'):
+                                # Traditional sklearn-like interface or fallback model
+                                lgbm_probs = self._lgbm_model.predict_proba(x_np)
+                                if lgbm_probs.ndim == 2:
+                                    lgbm_prob = float(lgbm_probs[0, 1])
+                                else:
+                                    lgbm_prob = float(lgbm_probs[0])
+                            else:
+                                # New ONNX ensemble loader interface
+                                lgbm_probs = self._lgbm_model.predict_proba(x_np)
+                                lgbm_prob = float(lgbm_probs[0])
                             prob_attack = 0.5 * prob_attack + 0.5 * lgbm_prob
                         except Exception:
                             pass
@@ -1993,7 +2457,7 @@ class MQTTInference:
                     if self.total < 5 or self.total % 100 == 0:
                         logger.info("Publishing prediction to %s: %s", topic, payload)
                     retain_flag = bool(getattr(self, '_retain_predictions', False))
-                    result = client.publish(topic, payload, qos=0, retain=retain_flag)
+                    result = self.client.publish(topic, payload, qos=0, retain=retain_flag)
                     # paho returns MQTTMessageInfo with .rc
                     try:
                         rc = getattr(result, 'rc', None)
@@ -2052,7 +2516,7 @@ class MQTTInference:
                                     health_payload[k] = float(ds[k]) if ds[k] is not None else None
                     except Exception:
                         pass
-                    client.publish(self.health_topic, json.dumps(health_payload), qos=0)
+                    self.client.publish(self.health_topic, json.dumps(health_payload), qos=0)
                 except Exception as e:
                     logger.debug("Health publish failed: %s", e)
         except Exception as e:
@@ -2106,6 +2570,17 @@ class MQTTInference:
         return model
 
     def start(self):
+        # Start MQTT message worker pool
+        for i in range(self.worker_pool_size):
+            t = threading.Thread(target=self._mqtt_message_worker, daemon=True, name=f"p4-mqtt-worker-{i}")
+            t.start()
+            logger.info("Started Phase4 MQTT message worker %d/%d", i+1, self.worker_pool_size)
+        
+        # Start queue monitoring thread
+        monitor_thread = threading.Thread(target=self._queue_monitor, daemon=True, name="p4-queue-monitor")
+        monitor_thread.start()
+        logger.info("Started Phase4 queue monitor thread")
+        
         attempt = 0
         backoff = self._connect_backoff_initial
         while True:
