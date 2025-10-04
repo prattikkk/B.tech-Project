@@ -114,9 +114,24 @@ PHASE4_DIR = BASE_DIR / "artifacts_phase4"
 PHASE4_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# Inputs (Phase 1/2 artifacts)
-BEST_MODEL_PATH = PHASE2_DIR / "best_model_hybrid.pth"
+# Inputs (Phase 1/2 artifacts) - Standardized model path hierarchy
+# Priority: final_model_hybrid.pth > best_model_hybrid.pth (for consistency across phases)
 FINAL_MODEL_PATH = PHASE2_DIR / "final_model_hybrid.pth"
+BEST_MODEL_PATH = PHASE2_DIR / "best_model_hybrid.pth"
+
+# Auto-select canonical model path with fallback logic
+def get_default_model_path():
+    """Get the canonical model path with proper fallback hierarchy."""
+    if FINAL_MODEL_PATH.exists():
+        return FINAL_MODEL_PATH
+    elif BEST_MODEL_PATH.exists():
+        logger.info("Using best_model_hybrid.pth (final model not found)")
+        return BEST_MODEL_PATH
+    else:
+        # Return final model path as default - let downstream handle FileNotFoundError with proper message
+        return FINAL_MODEL_PATH
+
+DEFAULT_MODEL_PATH = get_default_model_path()
 QUANT_MODEL_PATH = PHASE2_DIR / "quantized_model_hybrid.pth"
 ONNX_MODEL_PATH  = PHASE2_DIR / "model_hybrid.onnx"
 QUANT_REPORT_JSON = PHASE2_DIR / "quantization_report.json"
@@ -283,14 +298,55 @@ def robust_torch_load(path, map_location=None):
 # Helpers: load artifacts & preprocessing
 # ----------------------
 def find_feature_order(explicit=None):
+    """Find feature_order.json with strict precedence rules to ensure consistency.
+    
+    Priority order (STRICT - no fallbacks that could cause inconsistency):
+    1. Explicit override path (if provided and exists)
+    2. Phase 2 artifacts (canonical source after training)
+    3. FAIL if Phase 2 not found (prevents silent inconsistencies)
+    
+    Args:
+        explicit: Optional explicit path to feature_order.json
+        
+    Returns:
+        str: Path to the authoritative feature_order.json
+        
+    Raises:
+        FileNotFoundError: If no authoritative feature_order.json is found
+        RuntimeError: If found feature_order.json appears invalid
+    """
     if explicit and os.path.exists(explicit):
-        return explicit
+        # Validate explicit file
+        try:
+            with open(explicit, 'r') as f:
+                order = json.load(f)
+            if not isinstance(order, list) or len(order) == 0:
+                raise RuntimeError(f"Invalid feature_order.json at {explicit}: must be non-empty list")
+            logger.info("Using explicit feature_order.json: %s (%d features)", explicit, len(order))
+            return explicit
+        except (json.JSONDecodeError, IOError) as e:
+            raise RuntimeError(f"Cannot read explicit feature_order.json at {explicit}: {e}")
+    
+    # Phase 2 is the canonical source after model training
     if os.path.exists(PHASE2_FEATURE_ORDER):
-        return PHASE2_FEATURE_ORDER
-    alt = os.path.join(PHASE1_DIR, "feature_order.json")
-    if os.path.exists(alt):
-        return alt
-    raise FileNotFoundError("feature_order.json not found (searched override, artifacts_phase2, artifacts_phase1)")
+        try:
+            with open(PHASE2_FEATURE_ORDER, 'r') as f:
+                order = json.load(f)
+            if not isinstance(order, list) or len(order) == 0:
+                raise RuntimeError(f"Invalid Phase 2 feature_order.json: must be non-empty list")
+            logger.info("Using Phase 2 feature_order.json: %s (%d features)", PHASE2_FEATURE_ORDER, len(order))
+            return PHASE2_FEATURE_ORDER
+        except (json.JSONDecodeError, IOError) as e:
+            raise RuntimeError(f"Cannot read Phase 2 feature_order.json: {e}")
+    
+    # No fallback to Phase 1 - this prevents silent inconsistencies
+    # Phase 1 feature order may differ from Phase 2 after feature pruning
+    raise FileNotFoundError(
+        "Phase 2 feature_order.json not found. This is required for consistent feature ordering. "
+        f"Expected location: {PHASE2_FEATURE_ORDER}. "
+        "Please run Phase 2 (model training) to generate the canonical feature order, "
+        "or provide explicit override path if using pre-trained model."
+    )
 
 class DummyScaler:
     def __init__(self, mean, scale):
@@ -423,7 +479,9 @@ def load_test_data():
 # ----------------------
 # Quantization + ONNX export
 # ----------------------
-def quantize_and_save(orig_model_path=BEST_MODEL_PATH, quant_path=QUANT_MODEL_PATH, device="cpu"):
+def quantize_and_save(orig_model_path=None, quant_path=QUANT_MODEL_PATH, device="cpu"):
+    if orig_model_path is None:
+        orig_model_path = DEFAULT_MODEL_PATH
     # If a prior quantization gating report exists and failed, surface and skip.
     try:
         if QUANT_REPORT_JSON.exists():
@@ -507,7 +565,9 @@ def quantize_and_save(orig_model_path=BEST_MODEL_PATH, quant_path=QUANT_MODEL_PA
     logger.info("Quantized model saved. sizes -> quant: %s bytes, orig: %s bytes", str(q_size), str(orig_size))
     return quant_path
 
-def export_onnx(orig_model_path=BEST_MODEL_PATH, onnx_path=ONNX_MODEL_PATH, opset_version=13, device="cpu"):
+def export_onnx(orig_model_path=None, onnx_path=ONNX_MODEL_PATH, opset_version=13, device="cpu"):
+    if orig_model_path is None:
+        orig_model_path = DEFAULT_MODEL_PATH
     logger.info("Export ONNX: Loading float model (from %s)...", orig_model_path)
     if not os.path.exists(orig_model_path):
         raise FileNotFoundError(orig_model_path)
@@ -811,7 +871,7 @@ def benchmark_model(model_path, split="val", num_samples=2000, cpus=1, device="c
             logger.error("Quantized model load/inference failed: %s. Attempting dynamic quantization fallback...", e)
             # Try to quantize the best float model and benchmark that
             try:
-                qp = quantize_and_save(orig_model_path=BEST_MODEL_PATH)
+                qp = quantize_and_save(orig_model_path=DEFAULT_MODEL_PATH)
                 if qp and os.path.exists(qp):
                     model = load_quantized_model(str(qp), device=device)
                     model.eval()
@@ -839,7 +899,7 @@ def benchmark_model(model_path, split="val", num_samples=2000, cpus=1, device="c
                         "p95_ms": float(np.percentile(times, 95) * 1000),
                         "mem_before_mb": mem_before,
                         "mem_after_mb": mem_after,
-                        "note": "dynamic quantization fallback from BEST_MODEL_PATH"
+                        "note": "dynamic quantization fallback from DEFAULT_MODEL_PATH"
                     }
                 else:
                     raise RuntimeError("Dynamic quantization did not produce a model path")
@@ -901,7 +961,9 @@ class MQTTInference:
                  scaler_override=None,
                  evaluation_json_override=None,
                  enable_ensemble=False,
-                 min_feature_presence=None):
+                 min_feature_presence=None,
+                 cli_threshold=None,
+                 cli_temperature=None):
         if mqtt is None:
             raise RuntimeError("paho-mqtt not installed; install via pip install paho-mqtt")
 
@@ -1018,30 +1080,75 @@ class MQTTInference:
             except Exception as _sig_e:
                 logger.warning("Artifact signature verification skipped/failed: %s", _sig_e)
 
-        # Load calibration from eval.json
-        eval_path = evaluation_json_override if evaluation_json_override else os.path.join(PHASE2_DIR, "evaluation.json")
-        self.temperature = 1.0
-        self.threshold = 0.5
-        self.already_standardized = False
-        if os.path.exists(eval_path):
-            try:
-                with open(eval_path, "r") as f:
-                    eval_json = json.load(f)
-                self.temperature = float(eval_json.get("calibration", {}).get("temperature", 1.0))
-                self.threshold = float(eval_json.get("meta", {}).get("val_best_threshold", 0.5))
-                self.threshold_deep_only = float(eval_json.get("meta", {}).get("val_best_threshold_deep_only", self.threshold))
-                self.already_standardized = eval_json.get("meta", {}).get("already_standardized", False)
-                # Decide active threshold (use deep-only when ensemble disabled)
-                self.active_threshold = self.threshold if self.enable_ensemble else (self.threshold_deep_only or self.threshold)
-                logger.info("Loaded temperature=%.4f, threshold=%.4f already_standardized=%s from eval.json",
-                            self.temperature, self.threshold, self.already_standardized)
-                # Future-proof: clamp sub-unity temperature (which would amplify logits) and retain original
-                if self.temperature < 1.0:
-                    self.original_temperature = self.temperature
-                    self.temperature = 1.0
-                    logger.warning("Clamped temperature %.4f -> 1.0 (temperatures <1 amplify logits, likely mis-saved).", self.original_temperature)
-            except Exception as e:
-                logger.warning("Failed to load eval.json: %s", e)
+        # Load calibration using unified threshold manager
+        try:
+            from threshold_manager import get_unified_thresholds
+            
+            # Get artifacts directory for threshold manager
+            artifacts_dir = os.path.dirname(evaluation_json_override) if evaluation_json_override else PHASE2_DIR
+            
+            # Resolve thresholds with proper precedence (CLI > env > eval.json > defaults)
+            threshold_values = get_unified_thresholds(
+                cli_threshold=cli_threshold,
+                cli_temperature=cli_temperature,
+                ensemble_enabled=self.enable_ensemble,
+                artifacts_dir=artifacts_dir
+            )
+            
+            self.temperature = threshold_values['temperature']
+            self.threshold = threshold_values['threshold']
+            self.active_threshold = threshold_values['active_threshold']
+            
+            # Load additional metadata from eval.json if available
+            eval_path = evaluation_json_override if evaluation_json_override else os.path.join(PHASE2_DIR, "evaluation.json")
+            self.already_standardized = False
+            self.threshold_deep_only = self.threshold  # fallback
+            
+            if os.path.exists(eval_path):
+                try:
+                    with open(eval_path, "r") as f:
+                        eval_json = json.load(f)
+                    self.already_standardized = eval_json.get("meta", {}).get("already_standardized", False)
+                    self.threshold_deep_only = float(eval_json.get("meta", {}).get("val_best_threshold_deep_only", self.threshold))
+                    
+                    # Update active threshold based on ensemble mode and deep-only availability
+                    if not self.enable_ensemble and self.threshold_deep_only:
+                        self.active_threshold = self.threshold_deep_only
+                        
+                    logger.info("Loaded metadata: already_standardized=%s threshold_deep_only=%.4f", 
+                               self.already_standardized, self.threshold_deep_only)
+                except Exception as e:
+                    logger.warning("Failed to load additional metadata from eval.json: %s", e)
+            
+            logger.info("Unified thresholds: temperature=%.4f threshold=%.4f active_threshold=%.4f ensemble=%s",
+                       self.temperature, self.threshold, self.active_threshold, self.enable_ensemble)
+                       
+        except ImportError:
+            logger.warning("threshold_manager not available, falling back to legacy threshold loading")
+            # Fallback to legacy implementation
+            eval_path = evaluation_json_override if evaluation_json_override else os.path.join(PHASE2_DIR, "evaluation.json")
+            self.temperature = 1.0
+            self.threshold = 0.5
+            self.already_standardized = False
+            if os.path.exists(eval_path):
+                try:
+                    with open(eval_path, "r") as f:
+                        eval_json = json.load(f)
+                    self.temperature = float(eval_json.get("calibration", {}).get("temperature", 1.0))
+                    self.threshold = float(eval_json.get("meta", {}).get("val_best_threshold", 0.5))
+                    self.threshold_deep_only = float(eval_json.get("meta", {}).get("val_best_threshold_deep_only", self.threshold))
+                    self.already_standardized = eval_json.get("meta", {}).get("already_standardized", False)
+                    # Decide active threshold (use deep-only when ensemble disabled)
+                    self.active_threshold = self.threshold if self.enable_ensemble else (self.threshold_deep_only or self.threshold)
+                    logger.info("Loaded temperature=%.4f, threshold=%.4f already_standardized=%s from eval.json",
+                                self.temperature, self.threshold, self.already_standardized)
+                    # Future-proof: clamp sub-unity temperature (which would amplify logits) and retain original
+                    if self.temperature < 1.0:
+                        self.original_temperature = self.temperature
+                        self.temperature = 1.0
+                        logger.warning("Clamped temperature %.4f -> 1.0 (temperatures <1 amplify logits, likely mis-saved).", self.original_temperature)
+                except Exception as e:
+                    logger.warning("Failed to load eval.json: %s", e)
 
         model_path_str = str(model_path)
         # Special-case: quantized file names
@@ -2630,8 +2737,8 @@ def parse_args():
     p.add_argument("--cpulimit", type=int, default=1, help="Simulated CPU cores for inference (OMP threads)")
     p.add_argument("--run-mqtt", action="store_true", help="Run MQTT subscriber using model-path")
     # Allow legacy/short aliases for convenience (--model)
-    p.add_argument("--model-path", "--model", dest="model_path", default=BEST_MODEL_PATH,
-                   help="Path to .pth or .onnx model for MQTT (aliases: --model). Default is best non-quantized for accuracy")
+    p.add_argument("--model-path", "--model", dest="model_path", default=DEFAULT_MODEL_PATH,
+                   help="Path to .pth or .onnx model for MQTT (aliases: --model). Default prioritizes final_model_hybrid.pth over best_model_hybrid.pth for consistency")
     p.add_argument("--quantize-on-load", action="store_true", help="Load best float model and apply dynamic quantization on-the-fly for MQTT inference")
     # Provide short aliases to match user expectations (--broker, --port, --topic, --predictions-topic, --health-topic)
     p.add_argument("--mqtt-broker", "--broker", dest="mqtt_broker", default="localhost", help="MQTT broker hostname/IP (alias: --broker)")
@@ -2671,6 +2778,10 @@ def parse_args():
     p.add_argument("--auto-calibrate-temperature", action="store_true", help="Adapt temperature based on observed logit gap p99 vs training p99 to mitigate overconfidence")
     p.add_argument("--lock-noscale-if-standardized", action="store_true", help="If domain detector concludes standardized-like, permanently disable scaling (avoid double scaling)")
     p.add_argument("--enable-temp-decay", action="store_true", help="Allow temperature to decay downward once logit gap p99 stabilizes near training distribution")
+    
+    # Unified threshold management (highest priority - overrides all other sources)
+    p.add_argument("--threshold", type=float, help="Override threshold for anomaly detection (overrides env vars and evaluation.json)")
+    p.add_argument("--temperature", type=float, help="Override temperature for logit scaling (overrides env vars and evaluation.json)")
     # New explicit artifact override arguments for clarity
     p.add_argument("--onnx-path", dest="onnx_path", default=ONNX_MODEL_PATH, help="Override default ONNX model path for export/benchmark (defaults to artifacts_phase2/model_hybrid.onnx)")
     p.add_argument("--scaler", dest="scaler_path", default=None, help="Optional explicit scaler.pkl/json path override")
@@ -2805,7 +2916,10 @@ def main():
                             scaler_override=args.scaler_path,
                             evaluation_json_override=args.evaluation_json_path,
                             enable_ensemble=args.enable_ensemble,
-                            min_feature_presence=args.min_feature_presence)
+                            min_feature_presence=args.min_feature_presence,
+                            # Pass CLI threshold overrides to unified threshold manager
+                            cli_threshold=getattr(args, 'threshold', None),
+                            cli_temperature=getattr(args, 'temperature', None))
         logger.debug("Feature order length=%d", len(inf.feature_order))
         # Retain flag for prediction publishes (dashboard can catch last value on connect)
         try:

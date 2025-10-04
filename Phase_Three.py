@@ -184,6 +184,14 @@ import pandas as pd
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from jsonschema import validate as _json_validate, Draft7Validator as _Draft7Validator
 from rotating_csv_logger import RotatingCSVLogger
+
+# Import unified threshold manager
+try:
+    from threshold_manager import ThresholdManager
+    THRESHOLD_MANAGER_AVAILABLE = True
+except ImportError:
+    ThresholdManager = None  # type: ignore
+    THRESHOLD_MANAGER_AVAILABLE = False
 # Make artifacts directory importable for the auto-generated inference wrapper
 try:
     _artifacts_dir_guess = _os.path.join(_this_dir, "artifacts_phase2")
@@ -989,14 +997,43 @@ def _alert_eval_loop():
 # Coverage warning toggle (set to 0 to suppress per-message coverage warnings)
 COVERAGE_WARNINGS = os.getenv("COVERAGE_WARNINGS", "1").lower() in ("1","true","yes")
 
-# ----------------- Verify artifacts exist -----------------
-if not PHASE2_DIR.exists():
-    raise FileNotFoundError(f"Phase2 artifacts dir not found: {PHASE2_DIR}")
+# ----------------- Load canonical feature order -----------------
+def load_canonical_feature_order():
+    """Load feature order from the canonical Phase 2 source with validation.
+    
+    Returns:
+        tuple: (feature_order: List[str], num_features: int)
+        
+    Raises:
+        FileNotFoundError: If Phase 2 artifacts not found
+        RuntimeError: If feature order is invalid
+    """
+    if not PHASE2_DIR.exists():
+        raise FileNotFoundError(f"Phase2 artifacts dir not found: {PHASE2_DIR}")
 
-if not FEATURE_ORDER_PATH.exists():
-    raise FileNotFoundError(f"feature_order.json missing at {FEATURE_ORDER_PATH}")
-FEATURE_ORDER = json.loads(FEATURE_ORDER_PATH.read_text())
-NUM_FEATURES = len(FEATURE_ORDER)
+    if not FEATURE_ORDER_PATH.exists():
+        raise FileNotFoundError(
+            f"Canonical feature_order.json missing at {FEATURE_ORDER_PATH}. "
+            "This file is created by Phase 2 (model training) and contains the "
+            "authoritative feature order after any pruning. Please run Phase 2 first."
+        )
+    
+    try:
+        feature_order = json.loads(FEATURE_ORDER_PATH.read_text())
+        if not isinstance(feature_order, list) or len(feature_order) == 0:
+            raise RuntimeError("feature_order.json must contain a non-empty list of feature names")
+        
+        logger.info("Loaded canonical feature order: %d features from %s", 
+                   len(feature_order), FEATURE_ORDER_PATH)
+        return feature_order, len(feature_order)
+        
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid JSON in feature_order.json at {FEATURE_ORDER_PATH}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load feature_order.json: {e}")
+
+# Load canonical feature order with validation
+FEATURE_ORDER, NUM_FEATURES = load_canonical_feature_order()
 
 # clip bounds
 if CLIP_BOUNDS_PATH.exists():
@@ -1040,17 +1077,41 @@ if EVAL_PATH.exists():
 else:
     logger.warning("evaluation.json not found; using defaults")
 
-TEMPERATURE = float(eval_json.get("calibration", {}).get("temperature", 1.0))
-VAL_BEST_THRESHOLD = float(eval_json.get("meta", {}).get("val_best_threshold", eval_json.get("val", {}).get("threshold", ALERT_THRESHOLD)))
-VAL_BEST_THRESHOLD_DEEP_ONLY = float(eval_json.get("meta", {}).get("val_best_threshold_deep_only", VAL_BEST_THRESHOLD))
+# Load thresholds using unified threshold manager
+if THRESHOLD_MANAGER_AVAILABLE:
+    try:
+        from threshold_manager import get_unified_thresholds
+        unified = get_unified_thresholds()
+        ACTIVE_THRESHOLD = unified['threshold']
+        TEMPERATURE = unified['temperature']
+        logger.info("Using unified threshold manager: threshold=%.4f, temperature=%.4f", ACTIVE_THRESHOLD, TEMPERATURE)
+    except Exception as e:
+        logger.warning("Threshold manager failed, falling back to evaluation.json: %s", e)
+        # Fallback to original logic
+        TEMPERATURE = float(eval_json.get("calibration", {}).get("temperature", 1.0))
+        VAL_BEST_THRESHOLD = float(eval_json.get("meta", {}).get("val_best_threshold", eval_json.get("val", {}).get("threshold", ALERT_THRESHOLD)))
+        VAL_BEST_THRESHOLD_DEEP_ONLY = float(eval_json.get("meta", {}).get("val_best_threshold_deep_only", VAL_BEST_THRESHOLD))
+        ENSEMBLE_CFG = eval_json.get("ensemble", {"use_lgbm": False})
+        ENABLE_ENSEMBLE = bool(ENSEMBLE_CFG.get("use_lgbm", False)) or os.getenv("ENABLE_ENSEMBLE", "0").lower() in ("1","true","yes")
+        ACTIVE_THRESHOLD = VAL_BEST_THRESHOLD if ENABLE_ENSEMBLE else VAL_BEST_THRESHOLD_DEEP_ONLY
+        logger.info("Active threshold=%.4f (ensemble=%s deep_only=%.4f full=%.4f)", ACTIVE_THRESHOLD, ENABLE_ENSEMBLE, VAL_BEST_THRESHOLD_DEEP_ONLY, VAL_BEST_THRESHOLD)
+else:
+    # Original threshold loading logic
+    TEMPERATURE = float(eval_json.get("calibration", {}).get("temperature", 1.0))
+    VAL_BEST_THRESHOLD = float(eval_json.get("meta", {}).get("val_best_threshold", eval_json.get("val", {}).get("threshold", ALERT_THRESHOLD)))
+    VAL_BEST_THRESHOLD_DEEP_ONLY = float(eval_json.get("meta", {}).get("val_best_threshold_deep_only", VAL_BEST_THRESHOLD))
+    ENSEMBLE_CFG = eval_json.get("ensemble", {"use_lgbm": False})
+    ENABLE_ENSEMBLE = bool(ENSEMBLE_CFG.get("use_lgbm", False)) or os.getenv("ENABLE_ENSEMBLE", "0").lower() in ("1","true","yes")
+    ACTIVE_THRESHOLD = VAL_BEST_THRESHOLD if ENABLE_ENSEMBLE else VAL_BEST_THRESHOLD_DEEP_ONLY
+    logger.info("Active threshold=%.4f (ensemble=%s deep_only=%.4f full=%.4f)", ACTIVE_THRESHOLD, ENABLE_ENSEMBLE, VAL_BEST_THRESHOLD_DEEP_ONLY, VAL_BEST_THRESHOLD)
+
+# Load other evaluation metadata
 ENSEMBLE_CFG = eval_json.get("ensemble", {"use_lgbm": False})
 KEPT_INDICES = eval_json.get("meta", {}).get("kept_feature_indices", None)
 NUM_CLASSES = int(eval_json.get("meta", {}).get("num_classes", 2))
 ALREADY_STANDARDIZED = eval_json.get("meta", {}).get("already_standardized", False)
 logger.info("Diagnostic: ALREADY_STANDARDIZED from eval.json: %s", ALREADY_STANDARDIZED)
 ENABLE_ENSEMBLE = bool(ENSEMBLE_CFG.get("use_lgbm", False)) or os.getenv("ENABLE_ENSEMBLE", "0").lower() in ("1","true","yes")
-ACTIVE_THRESHOLD = VAL_BEST_THRESHOLD if ENABLE_ENSEMBLE else VAL_BEST_THRESHOLD_DEEP_ONLY
-logger.info("Active threshold=%.4f (ensemble=%s deep_only=%.4f full=%.4f)", ACTIVE_THRESHOLD, ENABLE_ENSEMBLE, VAL_BEST_THRESHOLD_DEEP_ONLY, VAL_BEST_THRESHOLD)
 
 # if kept indices present, apply to FEATURE_ORDER
 if KEPT_INDICES:
@@ -1662,7 +1723,7 @@ def _process_batch(items: list):
         try:
             input_name = onnx_sess.get_inputs()[0].name
             logits = onnx_sess.run(None, {input_name: X})[0].astype(np.float32)
-            logits /= max(1e-6, float(TEMPERATURE))
+            logits = logits / max(1e-6, float(TEMPERATURE))
             probs = _softmax(logits)
             probs_deep = probs[:, 1]
         except Exception as e:

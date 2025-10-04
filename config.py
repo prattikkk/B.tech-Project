@@ -25,8 +25,10 @@ class Settings(BaseSettings):
     mqtt_tls_cert: Optional[str] = Field(None, env="MQTT_TLS_CERT")
     mqtt_tls_key: Optional[str] = Field(None, env="MQTT_TLS_KEY")
 
-    # Threshold / inference
+    # Threshold / inference (with unified threshold management support)
     alert_threshold: float = Field(0.5, env="ALERT_THRESHOLD")
+    anomaly_threshold: float = Field(0.495, env="ANOMALY_THRESHOLD")  # Phase 5 compatibility
+    temperature: float = Field(1.0, env="PHASE4_FORCE_TEMPERATURE")   # Temperature scaling
     micro_batch_size: int = Field(8, env="MICRO_BATCH_SIZE")
     micro_batch_latency_ms: int = Field(20, env="MICRO_BATCH_LATENCY_MS")
 

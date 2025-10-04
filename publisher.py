@@ -221,6 +221,34 @@ def main(args):
     else:
         indices = np.arange(N)
 
+    # Filter indices to control attack ratio (1 attack per args.attack_ratio messages)
+    if args.attack_ratio > 1:
+        filtered_indices = []
+        attack_indices = []
+        normal_indices = []
+        
+        # Separate attack (label=1) and normal (label=0) indices
+        for idx in indices:
+            if idx < len(y) and y[idx] == 1:
+                attack_indices.append(idx)
+            else:
+                normal_indices.append(idx)
+        
+        # Calculate how many attacks we need for the desired ratio
+        total_messages = len(indices)
+        target_attacks = max(1, total_messages // args.attack_ratio)
+        
+        # Limit attacks to target number
+        if len(attack_indices) > target_attacks:
+            attack_indices = rng.choice(attack_indices, target_attacks, replace=False).tolist()
+        
+        # Combine attack and normal indices
+        filtered_indices = attack_indices + normal_indices[:total_messages - len(attack_indices)]
+        rng.shuffle(filtered_indices)  # Shuffle to distribute attacks throughout
+        
+        indices = np.array(filtered_indices)
+        logger.info(f"Attack ratio filtering: {len(attack_indices)} attacks in {len(indices)} messages (1:{args.attack_ratio} ratio)")
+
     # MQTT setup
     client = mqtt.Client()
     if args.username:
@@ -405,6 +433,7 @@ def build_parser():
     p.add_argument("--username", type=str, default=None)
     p.add_argument("--password", type=str, default=None)
     p.add_argument("--once", action="store_true", help="publish dataset once and exit (default behavior)")
+    p.add_argument("--attack-ratio", type=int, default=20, help="ratio of normal to attack messages (1 attack per N messages, default=20)")
     return p
 
 if __name__ == "__main__":
